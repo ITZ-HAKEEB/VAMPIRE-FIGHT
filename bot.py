@@ -50,9 +50,10 @@ USERBOT_ID = None
 
 current_volume = 200       # 1-1000
 current_boost = 100        # 1-5000
-current_echo = 0            # 0-200
-current_gain = 0            # 0-500
-current_bass = 0            # 0-300
+current_high_volume = 0    # 0-2000; 0 disables extra gain
+current_echo = 0           # 0-200
+current_gain = 0           # 0-500
+current_bass = 0           # 0-300
 
 SAMPLE_RATE = 48000
 CHANNELS = 2
@@ -80,6 +81,20 @@ def get_boost_multiplier(value: int) -> float:
     return 1.0 + (1.5 * (value - 100) / 4900.0)
 
 
+# ================= HIGH VOLUME CURVE =================
+def get_high_volume_multiplier(value: int) -> float:
+    """
+    Map 0-2000 to an additional multiplier from 1x to 2x.
+    Setting 0 disables the additional gain.
+    """
+    value = max(0, min(2000, int(value)))
+
+    if value == 0:
+        return 1.0
+
+    return 1.0 + (value / 2000.0)
+
+
 # ================= AUTHORIZATION =================
 def is_authorized(_, __, message: Message):
     if not message.from_user:
@@ -105,6 +120,7 @@ def process_audio(raw_audio: bytes) -> bytes:
     Features:
     - Volume: 1-1000
     - Boost: 1-5000
+    - Additional high volume: 0-2000
     - Bass enhancement
     - Echo
     - Optional distortion
@@ -125,13 +141,17 @@ def process_audio(raw_audio: bytes) -> bytes:
     audio = audio[:usable_size].astype(np.float32)
     audio = audio.reshape(-1, CHANNELS)
 
-    # 1. Volume.
+    # 1. Standard volume.
     audio *= current_volume / 100.0
 
-    # 2. Boost.
+    # 2. Existing boost.
     audio *= get_boost_multiplier(current_boost)
 
-    # 3. Bass enhancement.
+    # 3. Additional high-volume control.
+    # 0 = disabled; 2000 = maximum additional 2x gain.
+    audio *= get_high_volume_multiplier(current_high_volume)
+
+    # 4. Bass enhancement.
     if current_bass > 0:
         alpha = 0.03
         low = np.empty_like(audio)
@@ -146,7 +166,7 @@ def process_audio(raw_audio: bytes) -> bytes:
         bass_amount = current_bass / 100.0
         audio += low * bass_amount
 
-    # 4. Echo.
+    # 5. Echo.
     if current_echo == 0:
         echo_buffer.fill(0)
     else:
@@ -170,8 +190,7 @@ def process_audio(raw_audio: bytes) -> bytes:
 
         audio = flat_audio.reshape(-1, CHANNELS)
 
-    # 5. Optional distortion.
-    # High values add distortion, so use moderate settings for clarity.
+    # 6. Optional distortion.
     if current_gain > 0:
         drive = 1.0 + min(current_gain, 500) / 50.0
 
@@ -179,10 +198,8 @@ def process_audio(raw_audio: bytes) -> bytes:
             (audio / 32767.0) * drive
         )
 
-    # 6. Peak limiter.
-    # Preserve the processed signal unless its peak risks clipping.
-    # This avoids hard digital clipping, though extreme gain can still
-    # reduce audio clarity.
+    # 7. Peak limiter.
+    # Prevent hard clipping; high gain can still affect clarity.
     peak = float(np.max(np.abs(audio))) if audio.size else 0.0
     target_peak = 30000.0
 
@@ -253,6 +270,7 @@ async def help_command(client: Client, message: Message):
         "• `.leavevc` - Stop bridge.\n"
         "• `.volume <1-1000>` - Set output volume.\n"
         "• `.boost <1-5000>` - Adjust controlled boost.\n"
+        "• `.highvolume <0-2000>` - Set additional volume gain.\n"
         "• `.echo <0-200>` - Set echo; 0 disables it.\n"
         "• `.gain <0-500>` - Set distortion; 0 disables it.\n"
         "• `.bass <0-300>` - Set bass boost; 0 disables it.\n"
@@ -427,6 +445,7 @@ async def join_vc(client: Client, message: Message):
                 f"🔊 Target: `{target_chat}`\n"
                 f"🎚 Volume: `{current_volume}/1000`\n"
                 f"📢 Boost: `{current_boost}/5000`\n"
+                f"🔊 High Volume: `{current_high_volume}/2000`\n"
                 f"🔁 Echo: `{current_echo}/200`\n"
                 f"🎛 Gain: `{current_gain}/500`\n"
                 f"🔊 Bass: `{current_bass}/300`\n\n"
@@ -539,6 +558,53 @@ async def set_boost(client: Client, message: Message):
 
     except Exception as e:
         logger.exception("Boost update failed")
+        await message.reply(f"❌ Error: {e}")
+
+
+# ================= .HIGHVOLUME =================
+@app.on_message(
+    filters.command("highvolume", prefixes=".") & sudo_filter
+)
+async def set_high_volume(client: Client, message: Message):
+    global current_high_volume
+
+    args = (message.text or "").split()
+
+    if len(args) < 2:
+        multiplier = get_high_volume_multiplier(current_high_volume)
+
+        await message.reply(
+            f"🔊 Current high volume: `{current_high_volume}/2000`\n"
+            f"🎚 Additional multiplier: `{multiplier:.2f}x`\n\n"
+            "Usage: `.highvolume <0-2000>`\n"
+            "Use `.highvolume 0` to disable extra gain."
+        )
+        return
+
+    try:
+        value = int(args[1])
+
+        if not 0 <= value <= 2000:
+            await message.reply(
+                "⚠️ Enter a value between 0 and 2000."
+            )
+            return
+
+        current_high_volume = value
+        multiplier = get_high_volume_multiplier(value)
+
+        await message.reply(
+            "✅ **High Volume Updated**\n\n"
+            f"🔊 Setting: `{value}/2000`\n"
+            f"🎚 Additional multiplier: `{multiplier:.2f}x`\n"
+            "ℹ️ Very high settings may distort audio or trigger limiting."
+        )
+
+    except ValueError:
+        await message.reply("❌ Enter a valid whole number.")
+
+    except Exception as e:
+        logger.exception("High volume update failed")
         await message.reply(f"❌ Error: {e}")
 
 
